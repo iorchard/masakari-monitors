@@ -59,7 +59,7 @@ class HandleHost(driver.DriverBase):
 
     def _check_pacemaker_services(self, target_service):
         try:
-            cmd_str = 'systemctl status ' + target_service
+            cmd_str = 'pidof ' + target_service
             command = cmd_str.split(' ')
 
             # Execute command.
@@ -81,9 +81,9 @@ class HandleHost(driver.DriverBase):
         """
         # Check whether the pacemaker services is normal.
         corosync_status = self._check_pacemaker_services('corosync')
-        pacemaker_status = self._check_pacemaker_services('pacemaker')
+        pacemaker_status = self._check_pacemaker_services('pacemakerd')
         pacemaker_remote_status = self._check_pacemaker_services(
-            'pacemaker_remote')
+            'pacemaker_remoted')
 
         if corosync_status is False or pacemaker_status is False:
             if pacemaker_remote_status is False:
@@ -103,43 +103,27 @@ class HandleHost(driver.DriverBase):
             return 2
 
         # Check whether the corosync communication is normal.
-        corosync_multicast_interfaces = \
-            CONF.host.corosync_multicast_interfaces.split(',')
-        corosync_multicast_ports = \
-            CONF.host.corosync_multicast_ports.split(',')
+        # Modified by Heechul Kim
+        # Use pcs command to check remote resource is configured 
+        # since there is no corosync configuration in compute nodes.
+        is_resource_registered = False
+        cmd_str = ("pcs status resources %s") % (self.my_hostname)
+        command = cmd_str.split(' ')
+        try:
+            out, err = utils.execute(*command, run_as_root=True)
+            if err:
+               raise Exception(err)
+            LOG.info("%s", out)
+            is_resource_registered = True
+        except Exception as e:
+            LOG.warning("Exception caught: %s", e)
+            msg = ("Remote resource '%s' is not registered.") \
+                % self.my_hostname
+            LOG.warning("%s", msg)
 
-        if len(corosync_multicast_interfaces) != len(corosync_multicast_ports):
-            msg = ("Incorrect parameters corosync_multicast_interfaces or "
-                   "corosync_multicast_ports.")
-            LOG.error("%s", msg)
+        if is_resource_registered is False:
+            LOG.error("Remote resource is not registered in cluster.")
             return 2
-
-        is_nic_normal = False
-        for num in range(0, len(corosync_multicast_interfaces)):
-            cmd_str = ("timeout %s tcpdump -n -c 1 -p -i %s port %s") \
-                % (CONF.host.tcpdump_timeout,
-                   corosync_multicast_interfaces[num],
-                   corosync_multicast_ports[num])
-            command = cmd_str.split(' ')
-
-            try:
-                # Execute tcpdump command.
-                out, err = utils.execute(*command, run_as_root=True)
-
-                # If command doesn't raise exception, nic is normal.
-                msg = ("Corosync communication using '%s' is normal.") \
-                    % corosync_multicast_interfaces[num]
-                LOG.info("%s", msg)
-                is_nic_normal = True
-                break
-            except Exception:
-                msg = ("Corosync communication using '%s' is failed.") \
-                    % corosync_multicast_interfaces[num]
-                LOG.warning("%s", msg)
-
-        if is_nic_normal is False:
-            LOG.error("Corosync communication is failed.")
-            return 1
 
         return 0
 
@@ -282,28 +266,26 @@ class HandleHost(driver.DriverBase):
 
         # Check if host status changed.
         for node_state_tag in node_state_tag_list:
-
+            hostname = node_state_tag.get('uname')
             # hostmonitor doesn't monitor itself.
-            if node_state_tag.get('uname') == self.my_hostname:
+            if hostname == self.my_hostname:
                 continue
 
             # Get current status and old status.
             current_status = node_state_tag.get('crmd')
-            old_status = self.status_holder.get_host_status(
-                node_state_tag.get('uname'))
+            old_status = self.status_holder.get_host_status(hostname)
 
             # If old_status is None, This is first get of host status.
             if old_status is None:
                 msg = ("Recognized '%s' as a new member of cluster."
                        " Host status is '%s'.") \
-                    % (node_state_tag.get('uname'), current_status)
+                    % (hostname, current_status)
                 LOG.info("%s", msg)
                 self.status_holder.set_host_status(node_state_tag)
                 continue
 
             # Output host status.
-            msg = ("'%s' is '%s'.") % (node_state_tag.get('uname'),
-                                       current_status)
+            msg = ("'%s' is '%s'.") % (hostname, current_status)
             LOG.info("%s", msg)
 
             # If host status changed, send a notification.
@@ -316,8 +298,7 @@ class HandleHost(driver.DriverBase):
                         % current_status
                     LOG.info("%s", msg)
                 else:
-                    event = self._make_event(node_state_tag.get('uname'),
-                                             current_status)
+                    event = self._make_event(hostname, current_status)
 
                     # Send a notification.
                     self.notifier.send_notification(
@@ -409,7 +390,7 @@ class HandleHost(driver.DriverBase):
                 # It only checks when this process runs on the full cluster
                 # stack of corosync.
                 pacemaker_remote_status = self._check_pacemaker_services(
-                    'pacemaker_remote')
+                    'pacemaker_remoted')
                 if pacemaker_remote_status is False:
                     if self._check_host_status_by_crmadmin() != 0:
                         LOG.warning("hostmonitor skips monitoring hosts.")
